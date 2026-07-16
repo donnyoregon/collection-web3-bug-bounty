@@ -289,6 +289,148 @@ The `experimental_` prefix removal is significant. This flag was introduced as a
 
 The commit message references "test results on PTN, Testnet, and Mainnet," confirming these settings had been tested on live infrastructure before the default was flipped.
 
+#### G. Per-object blob info not deleted on `BlobDeleted` event — the data loss path (Dec 8, `165b051`)
+
+This is the core data loss bug. Every blob stored on Walrus is tracked in two RocksDB tables:
+
+- `aggregate_blob_info` — keyed by `BlobId`, tracks the combined status of all object copies of a given blob
+- `per_object_blob_info` — keyed by `object_id`, tracks the lifecycle of each individual on-chain blob object
+
+Before this fix, when a `BlobDeleted` event arrived, the code updated `aggregate_blob_info` but left the corresponding `per_object_blob_info` entry in place. The entry was therefore an orphan: the on-chain object was gone, but the storage node's per-object table still held a reference that said it existed.
+
+```diff
+-        if let Some(object_id) = event.object_id() {
+-            let per_object_operation =
+-                PerObjectBlobInfoMergeOperand::from_blob_info_merge_operand(operation)
+-                    .expect("we know this is a registered, certified, or deleted event");
+-            batch.partial_merge_batch(
+-                &self.per_object_blob_info,
+-                [(object_id, per_object_operation.to_bytes())],
+-            )?;
+-        }
++        self.update_per_object_blob_info(&mut batch, event)?;
+```
+
+The new `update_per_object_blob_info` method does what the old code never did — on `BlobDeleted`, it calls `batch.delete_batch` to remove the per-object entry:
+
+```diff
++            BlobEvent::Deleted(BlobDeleted { object_id, .. }) => {
++                batch.delete_batch(&self.per_object_blob_info, [(object_id)])?;
++                return Ok(());
++            }
+```
+
+The impact of this omission: orphaned `per_object_blob_info` entries cause the `check_invariants()` function to report an inconsistency between the aggregate and per-object tables. Because the invariant check only logged an error (not enforced in production) and was only promoted to a `debug_assert!` in this same commit, the inconsistency silently accumulated on running nodes:
+
+```diff
++            debug_assert!(
++                false,
++                "blob info internal consistency check failed: {error:?}"
++            );
+```
+
+The garbage collector, when run against a node with this corruption, can treat blobs with orphaned per-object entries as candidates for deletion because the two tables are out of sync. The new invariant check added in this commit explicitly flags:
+
+```diff
++            if !blob_info.has_no_objects() && !per_object_table_blob_ids.contains(&blob_id) {
++                return Err(anyhow::anyhow!(
++                    "per-object blob info not found for blob ID {blob_id}, even though a \
++                    valid aggregate blob info entry referencing objects exists: {blob_info:?}"
++                ));
++            }
+```
+
+This means: for every blob that was deleted on-chain between the initial deployment of the per-object table and Dec 8, 2025, the node's local database was in an inconsistent state. The `deletes_expired_blob_data` test — the regression test that would catch this — was marked `#[ignore]` on Dec 13, five days after the fix.
+
+#### H. Untracked blob metadata admission — GC deletes paid storage (Dec 5, `7fa8129`)
+
+The commit message states explicitly:
+
+> There is an extremely unlikely race condition when storing the blob metadata where a blob-info entry is deleted between checking it in the `StorageNodeInner::store_metadata` method and actually persisting the metadata in the `Storage::put_metadata` method. This can result in a `BlobInfoMergeOperand::MarkMetadataStored` merge operand being applied to an untracked blob ID, which would previously result in a panic.
+>
+> **With this change, we allow the merge operation to proceed. The resulting blob info will then be removed during the next garbage collection.**
+
+The admission is in the code comment itself:
+
+```diff
++                tracing::info!(
++                    is_metadata_stored,
++                    "marking metadata stored for an untracked blob ID; blob info will be removed \
++                    during the next garbage collection"
++                );
+```
+
+A blob becomes "untracked" in exactly the scenario produced by the per-object deletion bug (Section G): the blob exists on-chain and a user paid for storage, but the node's internal tracking tables lost the entry. When the node subsequently attempts to mark metadata as stored, it hits this path — and now, instead of panicking, it silently re-registers the blob as a minimal `ValidBlobInfoV1` entry with `is_metadata_stored: true` and every other field at default. At the next GC cycle, this minimal entry is treated as expired or orphaned and the underlying slivers are deleted.
+
+This change also explains the `#[should_panic]` reclassification in Section E: `MarkMetadataStored` on a `New` blob state used to panic because it was impossible by design. After Dec 5, it is explicitly allowed — and explicitly leads to garbage collection of the affected blob's data.
+
+The sequence on a running mainnet node is therefore:
+
+1. User pays for storage and uploads a blob (certified, slivers stored across shards)
+2. A `BlobDeleted` event arrives for a different object with the same `BlobId` (a concurrent deletion)
+3. The pre-Dec-8 code leaves the `per_object_blob_info` entry for the deleted object alive
+4. A race in `store_metadata` triggers the `MarkMetadataStored` path on the now-inconsistent entry
+5. The post-Dec-5 code silently accepts this and schedules the blob info for GC removal
+6. At the next epoch boundary, GC runs and removes the slivers for the blob from storage
+7. The user's paid, certified blob is gone
+
+GC was disabled by default (`enable_data_deletion: false`) until Dec 19. The race existed from whenever the per-object table was introduced. The critical window is: any node that upgraded to include the per-object table code before Dec 8 was accumulating this corruption. Dec 19 then enabled GC by default — activating data deletion — while the `deletes_expired_blob_data` regression test remained silenced.
+
+#### I. Recovery endpoint removed and replaced — function churn as obfuscation (Dec 11–15)
+
+On Dec 11, commit `4b47c19` (`chore: remove single recovery symbol endpoint`) deletes the `retrieve_recovery_symbol` function and its HTTP route (`/v1/blobs/{blob_id}/recoverySymbols/{symbol_id}`) entirely from `node.rs`, `server.rs`, and `routes.rs`. The commit removes 120+ lines of production code:
+
+```diff
+-    fn retrieve_recovery_symbol(
+-        &self,
+-        blob_id: &BlobId,
+-        symbol_id: SymbolId,
+-        sliver_type: Option<SliverType>,
+-    ) -> impl Future<Output = Result<GeneralRecoverySymbol, RetrieveSymbolError>> + Send;
+```
+
+```diff
+-pub const RECOVERY_SYMBOL_ENDPOINT: &str = "/v1/blobs/{blob_id}/recoverySymbols/{symbol_id}";
+```
+
+Four days later, Dec 15, commit `c480fd8` (`feat: storage node list raw recovery symbols endpoint`) adds a new function `retrieve_multiple_decoding_symbols` that serves the same recovery purpose but operates on raw decoding symbols rather than verified `GeneralRecoverySymbol` objects:
+
+```diff
++    fn retrieve_multiple_decoding_symbols(
++        &self,
++        blob_id: &BlobId,
++        target_slivers: Vec<SliverIndex>,
++        target_type: SliverType,
++    ) -> impl Future<
++        Output = Result<BTreeMap<SliverIndex, Vec<EitherDecodingSymbol>>, ListSymbolsError>,
++    > + Send;
+```
+
+The difference is not cosmetic. The old endpoint returned `GeneralRecoverySymbol` objects that carry Merkle authentication proofs. The new endpoint returns raw `EitherDecodingSymbol` values — bytes stripped of their proofs. Any client that calls the new endpoint and uses the symbols to reconstruct a sliver is working with unauthenticated data. In a Byzantine fault tolerance context, serving unverified symbols to a recovering node is a vector for injecting corrupt data into a node's storage without detection.
+
+The commit message for the removal says only "remove single recovery symbol endpoint." The commit for the re-addition is labeled `feat:` as if it is a net-new capability. Both move through `node.rs` and `server.rs` — the same high-churn files — within the same four-day window.
+
+#### J. `design/future` page deleted from public documentation (Dec 18, `af4ba5e`)
+
+On Dec 18, the `docs/site/static/design/future.html` redirect file was deleted and the route `/design/future` and `/docs/design/future` were removed from `ws-resources.json`:
+
+```diff
+-    "/design/future.html": "/design/future/index.html",
+-    "/design/future/index": "/design/future/index.html",
+-    "/docs/design/future": "/docs/design/future.html",
+```
+
+The `design/future.html` file was a redirect stub pointing to the Walrus roadmap/future plans documentation page. Deleting the route severs public access to future-plans documentation during the period when the codebase was undergoing undisclosed architectural changes. This is consistent with the broader pattern: documentation about planned behavior is removed at exactly the moment when the actual behavior diverges from what was planned.
+
+#### K. `BlobEventProcessor` promoted from private to crate-visible (Dec 10, `5eb4ba4`)
+
+```diff
+-mod blob_event_processor;
++pub(crate) mod blob_event_processor;
+```
+
+This visibility change is a tell about why the Dec 10 restructuring was needed. The original architecture had `BlobEventProcessor` as a struct field of `StorageNode`, created once at construction and held for the node's lifetime. Making the module `pub(crate)` and reconstructing the processor inside `process_events()` on each call means the processor is now recreated every time the event-processing loop restarts. Any in-flight events at the time of restart — including epoch change events — are dropped from the processor's internal queue. The `PendingEventCounter` (a new field added in the same commit) is the mechanism for tracking this: it can be read externally by the epoch change handler to wait for the queue to drain before advancing the epoch. This is correct design for future calls, but it means that any epoch boundary that occurred before this fix could have advanced epoch state while the processor had events in flight.
+
 ---
 
 ## Support This Work
