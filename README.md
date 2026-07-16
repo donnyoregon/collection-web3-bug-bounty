@@ -29,6 +29,30 @@ I am available to audit your project. My tooling traces protocol insolvency bugs
 
 ---
 
+## Evidence Index
+
+Every claim in this repository is backed by primary, independently verifiable evidence. None of it requires trusting me. All of it can be checked right now — on Etherscan, on GitHub, against the live contracts, or in the diff file committed to this repository.
+
+| Claim | Evidence type | How to verify independently |
+| :--- | :--- | :--- |
+| Marginal Protocol patched the vulnerability after my report | On-chain TX at Block [24386649](https://etherscan.io/block/24386649) | Open Etherscan, look up the block and TX hash documented in [`stealth_patch_tx.md`](https://github.com/donnyoregon/marginal-v1-disclosure/blob/main/tx-proof/stealth_patch_tx.md) |
+| The vulnerability I reported is real and exploitable | Mainnet fork PoC | Run [`full_exploit_code.t.sol`](https://github.com/donnyoregon/marginal-v1-disclosure/blob/main/full_exploit_code.t.sol) with `forge test --fork-url mainnet` |
+| The fix changed the bytecode at storage slot 6 | Storage slot diff | Compare archived slot 6 pre/post values in [`slot_6_diff.md`](https://github.com/donnyoregon/marginal-v1-disclosure/blob/main/storage-slot-diff/slot_6_diff.md) against Etherscan's storage reader |
+| Cantina's rejection was a "duplicate of a previously rejected finding" | Cantina's own written response | [`Cantina_Triage_Rejection_Thread.pdf`](https://github.com/donnyoregon/marginal-v1-disclosure/blob/main/cantina-rejection/Cantina_Triage_Rejection_Thread.pdf) — Cantina's words, not mine |
+| Frax Finance added `CannotRedeemZero()` after rejecting my report | Live contract bytecode | Check selector `0xb445ff79` against `0xfDC69e6BE352BD5644C438302DE4E311AAD5565b` on Etherscan; the guard is now present |
+| Frax's own code comment is the error selector proof | On-chain ABI | Etherscan's [contract ABI tab](https://etherscan.io/address/0xfDC69e6BE352BD5644C438302DE4E311AAD5565b#code) lists `CannotRedeemZero` |
+| Walrus silently fixed epoch desync by removing 50ms sleep | Committed diff | [`DECEMBER_CODE_CHANGES.diff`](DECEMBER_CODE_CHANGES.diff) line 54168 — readable in this repository right now |
+| Walrus fixed a deadlock in `BlobRetirementNotify::drop()` | Committed diff | [`DECEMBER_CODE_CHANGES.diff`](DECEMBER_CODE_CHANGES.diff) commit `6aba4f7` |
+| Walrus deleted a test covering the exact concurrency bug it fixed | Committed diff | [`DECEMBER_CODE_CHANGES.diff`](DECEMBER_CODE_CHANGES.diff) commit `0173958` — 113 lines removed |
+| Walrus enabled data deletion by default without an advisory | Committed diff | [`DECEMBER_CODE_CHANGES.diff`](DECEMBER_CODE_CHANGES.diff) commit `f3d9c38` — `enable_data_deletion: false` → `true` |
+| The internal Jira ticket WAL-1105 existed before the default flip | Source comment in diff | Search `WAL-1105` in [`DECEMBER_CODE_CHANGES.diff`](DECEMBER_CODE_CHANGES.diff) — `TODO(WAL-1105): Enable this by default.` was removed by the `chore:` commit |
+| The recovery endpoint replacement strips Merkle proofs | Committed diff | [`DECEMBER_CODE_CHANGES.diff`](DECEMBER_CODE_CHANGES.diff) commits `4b47c19` and `c480fd8` — `GeneralRecoverySymbol` replaced with `EitherDecodingSymbol` |
+| CERT/CC assigned VU#643748 to the Marginal finding | Federal advisory | [https://www.kb.cert.org/vuls/id/643748](https://www.kb.cert.org/vuls/id/643748) |
+
+The diff in this repository is 2.9 MB and 58,451 lines. It was committed on Dec 30, 2025 and has not been modified since. Every line in it came directly from `git log -p` on [MystenLabs/walrus](https://github.com/MystenLabs/walrus). The commit SHAs in the diff can be verified against the public MystenLabs repository at any time.
+
+---
+
 ## Disclosure Record
 
 The following cases are an immutable record of systemic fraud in the Web3 security industry. Each case includes the original vulnerability, the response, and preserved on-chain or repository evidence of the subsequent stealth fix.
