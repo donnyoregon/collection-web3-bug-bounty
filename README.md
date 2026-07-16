@@ -431,6 +431,47 @@ The `design/future.html` file was a redirect stub pointing to the Walrus roadmap
 
 This visibility change is a tell about why the Dec 10 restructuring was needed. The original architecture had `BlobEventProcessor` as a struct field of `StorageNode`, created once at construction and held for the node's lifetime. Making the module `pub(crate)` and reconstructing the processor inside `process_events()` on each call means the processor is now recreated every time the event-processing loop restarts. Any in-flight events at the time of restart — including epoch change events — are dropped from the processor's internal queue. The `PendingEventCounter` (a new field added in the same commit) is the mechanism for tracking this: it can be read externally by the epoch change handler to wait for the queue to drain before advancing the epoch. This is correct design for future calls, but it means that any epoch boundary that occurred before this fix could have advanced epoch state while the processor had events in flight.
 
+#### And they labeled this routine maintenance
+
+The eleven substantive findings above span Dec 2–19. Every one of them was merged under a commit label that suppressed visibility: `chore:`, `test:`, `fix:` (for the three that used the correct prefix), `feat:` (for the unauthenticated symbol endpoint introduced as a replacement), and `ci:`. Zero were labeled `security:`. Zero triggered a CVE. Zero accompanied an advisory. The `fix:` prefix appeared only three times, on Dec 10, all in a single day — and even those commit messages describe the changes in operational terms ("shutdown coordination," "racing notification") rather than identifying the underlying vulnerability class.
+
+The label pattern by finding:
+
+| Finding | Commit | Label used | Label that would have been accurate |
+| :--- | :--- | :--- | :--- |
+| A. Epoch desync / legacy provider removal | `c6e920a` | `chore:` | `security:` / `fix:` |
+| B. Deadlock at epoch boundary | `6aba4f7` | `fix:` | accurate, but commit message omits impact |
+| C. `SequentialProcessor` deleted | `a0fe265` | `chore:` | `fix:` — removed a serial-ordering guarantee |
+| D. Shutdown coordination (WAL-874/876) | `5eb4ba4` | `fix:` | accurate, but references internal Jira only |
+| D. Catchup / checkpoint tailing race | `c9af789` | `fix:` | accurate, but commit message omits impact |
+| E. Test deletion / behavior reclassification | `0173958` | `test:` | `fix:` — changed expected-panic to expected-success |
+| F. GC and data deletion enabled by default | `f3d9c38` | `chore:` | `feat:` at minimum; `security:` by consequence |
+| G. Per-object blob info not deleted | `165b051` | `fix:` | accurate, but not cross-referenced to Sections H or E |
+| H. Untracked blob metadata admission | `7fa8129` | `fix:` | accurate, but commit message frames it as "extremely unlikely" |
+| I. Recovery endpoint replaced (removal) | `4b47c19` | `chore:` | `fix:` / `security:` — removed authenticated path |
+| I. Recovery endpoint replaced (addition) | `c480fd8` | `feat:` | architectural regression — weakened authentication |
+| J. Roadmap docs deleted | `af4ba5e` | `ci:` | `chore:` at minimum; combined with `docs:` noise commit |
+| K. `BlobEventProcessor` visibility / ownership | `5eb4ba4` | `fix:` | accurate prefix, but the module visibility change is buried |
+
+Of the eleven findings, only four used `fix:` as their label. Three of the four `fix:` commits omit any description of the vulnerability class or affected users in the commit body. The remaining seven findings moved through the repository under `chore:`, `test:`, `feat:`, or `ci:` — labels that by convention signal zero user-facing impact, zero security relevance, and zero need for operator action.
+
+The internal tracking tells a different story. The `f3d9c38` (`chore:`) commit that enabled garbage collection and data deletion by default removed these two lines from `garbage_collector.rs`:
+
+```diff
+-            // TODO(WAL-1105): Enable this by default.
+-            enable_blob_info_cleanup: false,
+-            // TODO(WAL-1105): Enable this by default.
+-            enable_data_deletion: false,
+```
+
+WAL-1105 is an internal Jira ticket. The team had been tracking this change as a planned production flip. The same commit references "test results on PTN, Testnet, and Mainnet" in the body — confirming the change was coordinated across environments. The public commit label: `chore(node)`. No advisory. No migration guide. No changelog entry. No mention of the data loss path that the silenced `deletes_expired_blob_data` regression test would have caught.
+
+The commit labeled `test: various test improvements` (`0173958`) deleted 113 lines of coverage for the exact concurrency bug fixed on Dec 2 and Dec 10, reclassified a previously-panicking merge operand as expected-success, and reduced GC batch sizes to make scale-triggered failures less likely — all in a single commit, on a Saturday, four days after the data deletion defaults were enabled. The label was `test:`.
+
+The pattern across all 52 commits in the diff is: substantive node-level changes cluster in the first eleven days, carry suppressive labels, and are then buried under a flood of `docs:` commits that begins on Dec 11 and runs to Dec 19. The documentation flood does not document any of the security changes. It documents unrelated UI, redirects, and style guides. Its function is chronological dilution: a reader scanning the commit log sees the `docs:` volume and concludes the period was uneventful maintenance.
+
+It was not maintenance. They labeled it that way anyway.
+
 ---
 
 ## Support This Work
